@@ -44,7 +44,7 @@
             message {:schema "awai.mail/private-message-v1" :id "mail-1" :author sender :from "alice@example.test" :to ["bob@example.test"] :cc [] :subject "private" :text "hello" :sent-at 100 :in-reply-to nil}
             host {:recipient-host recipient-host :request! request! :resource resource :now! clock :author sender :bindings! (fn [] @address-bindings)
                   :policy! (fn [] {:roots #{(ed/public-key seed)} :revoked #{} :fresh-until 150
-                                    :bindings {sender (:recipient-key sender-key)}})}
+                                    :bindings {holder (:recipient-key identity) sender (:recipient-key sender-key)}})}
             nonce (edge/b64url->bytes (:nonce issued))]
         (-> (denied #(mail/prepare-passkey-seal! host (assoc message :to ["mallory@example.test"]) nonce (:pub identity) (:pq-pub identity) presentation others))
             (.then (fn [_] (check (zero? @calls))
