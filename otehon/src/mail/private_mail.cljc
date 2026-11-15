@@ -1,0 +1,69 @@
+(ns mail.private-mail
+  "Internal E2EE mail envelope. Not SMTP, OpenPGP, Bcc or a mail transport.
+   A trusted user-side host supplies authenticated address/key bindings,
+   current dango policy and independently verified sender/object admission."
+  (:require [awai.browser-authorized-envelope :as envelope]))
+
+(defn refuse [] (throw (ex-info "private mail refused" {})))
+(defn- text? [x n] (and (string? x) (<= 1 (count x) n)))
+(defn- address? [x]
+  (and (text? x 254) (boolean (re-matches #"[^\s@<>]+@[^\s@<>]+" x))))
+(defn- header? [x n]
+  (and (string? x) (<= (count x) n) (not (re-find #"[\r\n]" x))))
+(defn- mail? [m]
+  (and (map? m) (= #{:schema :id :author :from :to :cc :subject :text :sent-at :in-reply-to} (set (keys m)))
+       (= "awai.mail/private-message-v1" (:schema m)) (text? (:id m) 128) (text? (:author m) 256)
+       (address? (:from m)) (vector? (:to m)) (<= 1 (count (:to m)) 32)
+       (vector? (:cc m)) (<= (count (:cc m)) 32)
+       (every? address? (concat (:to m) (:cc m)))
+       (= (count (concat (:to m) (:cc m))) (count (set (concat (:to m) (:cc m)))))
+       (header? (:subject m) 998) (string? (:text m)) (<= (count (:text m)) 30000)
+       (js/Number.isSafeInteger (:sent-at m)) (<= 0 (:sent-at m))
+       (or (nil? (:in-reply-to m)) (and (text? (:in-reply-to m) 512) (header? (:in-reply-to m) 512)))))
+
+(defn- addresses-authorized! [host mail recipient-ids]
+  (let [bindings ((:bindings! host)) addresses (concat (:to mail) (:cc mail))
+        holders (mapv #(get bindings %) addresses)]
+    (when-not (and (map? bindings) (= (:author host) (:author mail))
+                   (= (:author host) (get bindings (:from mail)))
+                   (every? #(text? % 256) holders)
+                   (= recipient-ids (conj (set holders) (:author host)))) (refuse))))
+
+(defn seal!
+  "Only an independently authenticated host may provide :author, :resource,
+   :bindings!, :policy! and :now!. Bindings are checked before and after seal;
+   each recipient must also satisfy the shared dango and key-fingerprint gate."
+  [host mail recipients]
+  (when-not (and (map? host) (text? (:author host) 256) (text? (:resource host) 256)
+                 (fn? (:bindings! host)) (mail? mail) (vector? recipients)
+                 (every? map? recipients)) (refuse))
+  (let [ids (set (map :holder recipients))
+        _ (when-not (and (= (count ids) (count recipients)) (contains? ids (:author host))) (refuse))
+        _ (addresses-authorized! host mail ids)
+        plain (.encode (js/TextEncoder.) (js/JSON.stringify (clj->js mail)))]
+    (-> (js/Promise.resolve nil)
+        (.then (fn [] (envelope/seal host (:resource host) plain recipients)))
+        (.then (fn [sealed] (addresses-authorized! host mail ids) sealed))
+        (.finally (fn [] (.fill plain 0))))))
+
+(defn open!
+  "Host :admit! independently verifies the exact sender, object and recipient
+   set against a signed basis and current policy. :bindings! must be current and
+   authenticated; message/peer data cannot supply it. No Bcc is supported."
+  [host object expected recipient identity]
+  (when-not (and (map? host) (fn? (:admit! host)) (fn? (:bindings! host))
+                 (text? (:author host) 256) (map? expected)
+                 (= #{:resource :recipients :author :id} (set (keys expected)))
+                 (text? (:id expected) 128) (= (:author host) (:author expected))) (refuse))
+  (let [admit! (:admit! host)
+        scoped (assoc host :admit! (fn [_ candidate] (admit! expected candidate)))]
+    (-> (envelope/open scoped object (select-keys expected [:resource :recipients]) recipient identity)
+        (.then (fn [plain]
+          (try
+            (let [mail (js->clj (js/JSON.parse (.decode (js/TextDecoder. "utf-8" #js {:fatal true}) plain))
+                                :keywordize-keys true)]
+              (when-not (and (mail? mail) (= (:id expected) (:id mail))
+                             (= (:author expected) (:author mail))) (refuse))
+              (addresses-authorized! host mail (:recipients expected))
+              mail)
+            (finally (.fill plain 0))))))))
