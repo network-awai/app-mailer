@@ -2,7 +2,8 @@
   "Internal E2EE mail envelope. Not SMTP, OpenPGP, Bcc or a mail transport.
    A trusted user-side host supplies authenticated address/key bindings,
    current dango policy and independently verified sender/object admission."
-  (:require [awai.browser-authorized-envelope :as envelope]))
+  (:require [awai.browser-authorized-envelope :as envelope]
+            [awai.browser-recipient-envelope :as recipient-envelope]))
 
 (defn refuse [] (throw (ex-info "private mail refused" {})))
 (defn- text? [x n] (and (string? x) (<= 1 (count x) n)))
@@ -28,6 +29,31 @@
                    (= (:author host) (get bindings (:from mail)))
                    (every? #(text? % 256) holders)
                    (= recipient-ids (conj (set holders) (:author host)))) (refuse))))
+
+(defn prepare-passkey-seal!
+  "Prepare one recipient's Passkey proof and the full independently bound
+   recipient list. The trusted host must display the account, recipients and
+   operation and invoke :confirm! directly from a user gesture. No network or
+   SMTP operation is performed here."
+  [host mail nonce pub pq-pub presentation others]
+  (when-not (and (map? host) (text? (:author host) 256) (text? (:resource host) 256)
+                 (fn? (:bindings! host)) (map? (:recipient-host host)) (mail? mail)
+                 (vector? others) (every? map? others)) (refuse))
+  (let [ids (conj (set (map :holder others)) (get-in host [:recipient-host :holder]))]
+    (when-not (and (= (count ids) (inc (count others))) (contains? ids (:author host))) (refuse))
+    (addresses-authorized! host mail ids)
+    (-> (recipient-envelope/prepare! host nonce pub pq-pub presentation others)
+        (.then (fn [prepared]
+          (when-not (= ids (set (:recipients prepared))) (refuse))
+          (assoc (dissoc prepared :confirm!) :confirm!
+            (fn []
+              (addresses-authorized! host mail ids)
+              (let [plain (.encode (js/TextEncoder.) (js/JSON.stringify (clj->js mail)))]
+                (try
+                  (-> ((:confirm! prepared) plain)
+                      (.then (fn [sealed] (addresses-authorized! host mail ids) sealed))
+                      (.finally (fn [] (.fill plain 0))))
+                  (catch :default e (.fill plain 0) (throw e)))))))))))
 
 (defn seal!
   "Only an independently authenticated host may provide :author, :resource,
