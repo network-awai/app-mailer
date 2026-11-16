@@ -1,6 +1,7 @@
 (ns mail.passkey-seal-test
   (:require ["node:crypto" :as crypto] ["node:fs" :as fs] ["node:path" :as path]
-            [mail.private-mail :as mail]
+            [mail.private-mail :as mail] [mail.otehon-delivery-host :as delivery]
+            [awai.browser-shared-object :as wire] [multiformats.core :as mf]
             [awai.passkey-store :as store] [awai.recipient-proof-store :as persisted] [awai.otehon-passkey :as otehon]
             [dango.chain :as dango] [ed25519.sign :as ed] [envelope.keystore :as keys] [envelope.seal :as seal]
             [webauthn.adapters.edge :as edge] [webauthn.virtual-authenticator :as virtual]))
@@ -42,9 +43,25 @@
             others [{:holder sender :presentation sender-presentation :pub (:pub sender-key) :pq-pub (:pq-pub sender-key)}]
             address-bindings (atom {"alice@example.test" sender "bob@example.test" holder})
             message {:schema "awai.mail/private-message-v1" :id "mail-1" :author sender :from "alice@example.test" :to ["bob@example.test"] :cc [] :subject "private" :text "hello" :sent-at 100 :in-reply-to nil}
-            host {:recipient-host recipient-host :request! request! :resource resource :now! clock :author sender :bindings! (fn [] @address-bindings)
-                  :policy! (fn [] {:roots #{(ed/public-key seed)} :revoked #{} :fresh-until 150
-                                    :bindings {holder (:recipient-key identity) sender (:recipient-key sender-key)}})}
+            revoked (atom #{}) stored (atom nil) allowed (atom nil) writes (atom 0)
+            expected {:resource resource :recipients #{holder sender} :author sender :id "mail-1"}
+            byte-count (.-length (.encode (js/TextEncoder.) (js/JSON.stringify (clj->js message))))
+            host (delivery/bind!
+                   {:recipient-host recipient-host :request! request! :resource resource :now! clock :author sender
+                    :bindings! (fn [] @address-bindings)
+                    :policy! (fn [] {:roots #{(ed/public-key seed)} :revoked @revoked :fresh-until 150
+                                     :bindings {holder (:recipient-key identity) sender (:recipient-key sender-key)}})
+                    :delivery-grants! (fn [] {:byte-count byte-count :recipients
+                      [{:holder holder :presentation presentation :fingerprint (:recipient-key identity)}
+                       {:holder sender :presentation sender-presentation :fingerprint (:recipient-key sender-key)}]})
+                    :delivery-current! (fn [] true)
+                    :admit-cid! (fn [cid basis] (and (= cid @allowed) (= expected basis)))
+                    :admit! (fn [basis _] (= expected basis))
+                    :authorization! (fn [_] (js/Promise.resolve "Biscuit synthetic"))}
+                   db (:credential-id auth) holder)
+            client {:put-block! (fn [cid bytes authz] (check (= authz "Biscuit synthetic"))
+                                  (swap! writes inc) (reset! stored (js/Uint8Array.from bytes)) (js/Promise.resolve cid))
+                    :get-block (fn [_] (js/Promise.resolve (js/Uint8Array.from @stored)))}
             nonce (edge/b64url->bytes (:nonce issued))]
         (-> (denied #(mail/prepare-passkey-seal! host (assoc message :to ["mallory@example.test"]) nonce (:pub identity) (:pq-pub identity) presentation others))
             (.then (fn [_] (check (zero? @calls))
@@ -55,12 +72,17 @@
                 (check (= 1 @calls))
                 (-> pending
                     (.then (fn [sealed]
-                      (js/Promise.all #js [(mail/open! (assoc host :admit! (fn [_ _] true)) sealed
-                                             {:resource resource :recipients #{holder sender} :author sender :id "mail-1"} holder identity)
-                                           (mail/open! (assoc host :admit! (fn [_ _] true)) sealed
-                                             {:resource resource :recipients #{holder sender} :author sender :id "mail-1"} sender sender-key)])))
-                    (.then (fn [opened] (doseq [plain (array-seq opened)]
-                                          (check (= message plain)))
-                             (denied #((:confirm! prepared)))))))))))))
+                      (reset! allowed (mf/cidv1-raw (wire/encode sealed)))
+                      (mail/publish! host client sealed expected message)))
+                    (.then (fn [cid] (check (= 1 @writes))
+                      (mail/receive! host client cid expected holder identity)))
+                    (.then (fn [opened] (check (= message opened))
+                      (let [decision (dango/verify presentation {:roots #{(ed/public-key seed)} :revoked #{}
+                           :request {:req/kind :data/read :req/resource resource :req/holder holder :req/now 100 :req/bytes byte-count}})]
+                        (reset! revoked #{(first (:dango/cids decision))}))
+                      (denied #(mail/receive! host client @allowed expected holder identity))))
+                    (.then (fn [_] (reset! revoked #{}) (check (store/revoke! db (:credential-id auth)))
+                      (denied #(mail/receive! host client @allowed expected holder identity))))
+                    (.then (fn [_] (denied #((:confirm! prepared)))))))))))))
     (.then (fn [_] (.close db) (println (js/JSON.stringify #js {:passed true :scope "synthetic Mail address bindings and recipient Passkey proof"}))))
     (.catch (fn [e] (.close db) (js/console.error e) (set! (.-exitCode js/process) 1))))
