@@ -129,7 +129,7 @@
                     :delivery-grants! (fn [] {:byte-count byte-count :recipients
                       [{:holder holder :presentation presentation :fingerprint (:recipient-key identity)}
                        {:holder sender :presentation sender-presentation :fingerprint (:recipient-key sender-key)}]})
-                    :local-revocation-scope "mail-test" :delivery-current! (fn [] true)
+                    :local-revocation-scope "mail-test" :delivery-current! (fn [] true) :delivery-current-async! (fn [] (js/Promise.resolve true))
                     :admit-cid! (fn [cid basis] (and (= cid @allowed) (= expected basis)))
                     :admit! (fn [basis _] (= expected basis))}
                    db (:credential-id auth) holder
