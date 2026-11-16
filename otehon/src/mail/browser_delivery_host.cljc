@@ -1,6 +1,6 @@
 (ns mail.browser-delivery-host
   "Browser-side trusted host composition; no Node credential store."
-  (:require [awai.browser-delivery-host :as delivery] [awai.browser-dango-read-approval :as read]
+  (:require [awai.browser-delivery-host :as delivery] [awai.browser-local-revocations :as local] [awai.browser-dango-read-approval :as read]
             [awai.browser-block-authorization :as authorization] [awai.kotobase-block-adapter :as blocks]))
 (defn read-approved-delivery!
   "The host independently authenticates credentials, policy and local
@@ -23,3 +23,10 @@
               policy! identity-origin tenant-id audience broker start-selector redeem-selector signal allow-loopback-for-tests?)]
             {:host (assoc bound :authorization! authorize!)
              :client (blocks/client audience broker get-selector put-selector signal allow-loopback-for-tests?)}))))))
+
+(defn read-approved-local-delivery!
+  "Bind trusted local revocation state before requesting the signed snapshot.
+   The host still authenticates the scope, credential, policy and user consent."
+  [host trust credential-db binding local-db scope options]
+  (-> (local/bind-host! local-db scope host)
+      (.then (fn [bound] (read-approved-delivery! bound trust credential-db binding options)))))
