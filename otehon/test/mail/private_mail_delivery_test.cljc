@@ -1,7 +1,7 @@
 (ns mail.private-mail-delivery-test
   (:require [mail.private-mail :as mail] [awai.browser-shared-object :as wire]
             [dango.chain :as dango] [ed25519.sign :as ed]
-            [envelope.keystore :as keys] [envelope.seal-sync :as crypto]
+            [envelope.keystore :as keys] [envelope.seal :as seal] [envelope.seal-sync :as crypto]
             [multiformats.core :as mf]))
 
 (defn check [x] (when-not x (throw (js/Error. "private mail delivery test failed"))))
@@ -28,11 +28,12 @@
       (let [policy {:roots #{(ed/public-key seed)} :revoked #{} :fresh-until 150 :bindings {sender afp reader bfp}}
             bindings (atom {"alice@example.test" sender "bob@example.test" reader})
             sealing {:author sender :resource resource :bindings! #(deref bindings) :now! (fn [] 100) :policy! (fn [] policy)}
-            stored (atom {}) writes (atom 0) current (atom true) allowed (atom nil)
+            stored (atom {}) writes (atom 0) current (atom true) allowed (atom nil) fingerprints (atom {sender afp reader bfp})
             client {:put-block! (fn [cid bytes auth] (check (= auth "Biscuit synthetic")) (swap! writes inc)
                                   (swap! stored assoc cid (clone bytes)) (js/Promise.resolve cid))
                     :get-block (fn [cid] (js/Promise.resolve (some-> (get @stored cid) clone)))}
             host {:author sender :resource resource :bindings! #(deref bindings) :delivery-current! #(deref current)
+                  :delivery-fingerprints! #(deref fingerprints)
                   :admit-cid! (fn [cid basis] (and (= cid @allowed) (= expected basis)))
                   :authorization! (fn [_] (js/Promise.resolve "Biscuit synthetic"))
                   :admit! (fn [basis _] (= expected basis))}]
@@ -41,6 +42,8 @@
               (let [cid (mf/cidv1-raw (wire/encode sealed))]
                 (reset! allowed cid)
                 (-> (denied #(mail/publish! host client sealed (assoc expected :id "other") value))
+                    (.then (fn [_] (denied #(mail/publish! host client
+                                   (assoc-in sealed [:envelope :envelope/recipients 1 :recipient/pub] (seal/b64url (js/Uint8Array. 32))) expected value))))
                     (.then (fn [_] (check (zero? @writes)) (mail/publish! host client sealed expected value)))
                     (.then (fn [published]
                       (check (= cid published)) (check (= 1 @writes))
@@ -57,6 +60,9 @@
                       (let [changed (assoc host :authorization! (fn [_] (swap! bindings dissoc "bob@example.test") (js/Promise.resolve "Biscuit synthetic")))]
                         (denied #(mail/publish! changed client sealed expected value)))))
                     (.then (fn [_] (check (= 1 @writes)) (swap! bindings assoc "bob@example.test" reader)
+                      (let [rotating (assoc host :authorization! (fn [_] (swap! fingerprints assoc reader afp) (js/Promise.resolve "Biscuit synthetic")))]
+                        (denied #(mail/publish! rotating client sealed expected value)))))
+                    (.then (fn [_] (check (= 1 @writes)) (reset! fingerprints {sender afp reader bfp})
                       (let [calls (atom 0) changing (assoc host :admit! (fn [_ _] (= 1 (swap! calls inc))))]
                         (denied #(mail/receive! changing client cid expected reader (select-keys b [:priv :pq-priv]))))))
                     (.then (fn [_]
