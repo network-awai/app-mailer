@@ -8,7 +8,7 @@
   "Bind local Passkey and dango checks. The caller authenticates the address
    bindings, policy, signed basis, recipient grants and byte count."
   [host db credential-id holder]
-  (delivery/bind! host db credential-id holder 65536))
+  (delivery/bind-local-revocations! host db credential-id holder 65536 (:local-revocation-scope host)))
 
 (defn client!
   "Construct the ciphertext client with the host's broker and abort signal.

@@ -5,6 +5,7 @@
             [awai.browser-block-token :as block-token] [biscuit.wire :as wire]
             ["@noble/curves/ed25519.js" :refer [ed25519]] ["@noble/hashes/sha2.js" :refer [sha256]]
             [awai.passkey-store :as store] [awai.recipient-proof-store :as persisted] [awai.otehon-passkey :as otehon]
+            [awai.dango-local-revocations :as local-revocations]
             [dango.chain :as dango] [ed25519.sign :as ed] [envelope.keystore :as keys] [envelope.seal :as seal]
             [webauthn.adapters.edge :as edge] [webauthn.virtual-authenticator :as virtual]))
 (defn check [x] (when-not x (throw (js/Error. "browser recipient envelope test failed"))))
@@ -15,6 +16,8 @@
 (.mkdirSync fs dir #js {:mode 448})
 (def db (store/open-owned! (.join path dir "credentials.sqlite")))
 (persisted/initialize! db)
+(local-revocations/initialize-storage! db)
+(check (true? (local-revocations/initialize-scope! db "mail-test")))
 (def resource "kotoba://storage/browser-recipient")
 (def seed (vec (repeat 32 3)))
 (def auth-now 1800000000000) (def seconds (quot auth-now 1000))
@@ -115,6 +118,9 @@
                           :roots #{root-pub} :now! (fn [] auth-now) :current! (fn [_] true)
                           :accept! (fn [t r d v] (js/Promise.resolve (and (= t tenant) (= r 0) (= d snapshot-digest) (empty? v))))
                           :watermark-current! (fn [t r d] (js/Promise.resolve (and (= t tenant) (= r 0) (= d snapshot-digest))))}
+            _ (check (try (delivery/bind! {:policy! (fn [] {}) :local-revocation-scope "missing"}
+                                          db (:credential-id auth) holder) false
+                          (catch :default _ true)))
             pair (delivery/approved-delivery!
                    {:recipient-host recipient-host :request! request! :resource resource :now! clock :author sender
                     :bindings! (fn [] @address-bindings)
@@ -123,7 +129,7 @@
                     :delivery-grants! (fn [] {:byte-count byte-count :recipients
                       [{:holder holder :presentation presentation :fingerprint (:recipient-key identity)}
                        {:holder sender :presentation sender-presentation :fingerprint (:recipient-key sender-key)}]})
-                    :delivery-current! (fn [] true)
+                    :local-revocation-scope "mail-test" :delivery-current! (fn [] true)
                     :admit-cid! (fn [cid basis] (and (= cid @allowed) (= expected basis)))
                     :admit! (fn [basis _] (= expected basis))}
                    db (:credential-id auth) holder
@@ -166,7 +172,12 @@
                            :request {:req/kind :data/read :req/resource resource :req/holder holder :req/now 100 :req/bytes byte-count}})]
                         (reset! revoked #{(first (:dango/cids decision))}))
                       (denied #(mail/receive! host client @allowed expected holder identity))))
-                    (.then (fn [_] (reset! revoked #{}) (check (store/revoke! db (:credential-id auth)))
+                    (.then (fn [_] (reset! revoked #{})
+                      (let [decision (dango/verify presentation {:roots #{(ed/public-key seed)} :revoked #{}
+                            :request {:req/kind :data/read :req/resource resource :req/holder holder :req/now 100 :req/bytes byte-count}})]
+                        (local-revocations/revoke! db "mail-test" (first (:dango/cids decision))))
+                      (denied #(mail/receive! host client @allowed expected holder identity))))
+                    (.then (fn [_] (check (store/revoke! db (:credential-id auth)))
                       (denied #(mail/receive! host client @allowed expected holder identity))))
                     (.then (fn [_] (check (= 9 (count @operations))) (.abort controller)
                       (denied #((:confirm! prepared)))))))))))))
