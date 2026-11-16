@@ -65,6 +65,11 @@
                     (.then (fn [_] (check (= 1 @writes)) (reset! fingerprints {sender afp reader bfp})
                       (let [calls (atom 0) changing (assoc host :admit! (fn [_ _] (= 1 (swap! calls inc))))]
                         (denied #(mail/receive! changing client cid expected reader (select-keys b [:priv :pq-priv]))))))
+                    (.then (fn [_] (let [live (atom true) opened (atom false)
+                                           racing (assoc host :delivery-current-async! (fn [] (js/Promise.resolve @live))
+                                                              :admit! (fn [basis _] (reset! opened true) (reset! live false) (= expected basis)))]
+                                      (-> (denied #(mail/receive! racing client cid expected reader (select-keys b [:priv :pq-priv])))
+                                          (.then (fn [_] (check @opened)))))))
                     (.then (fn [_]
                       (let [bytes (clone (get @stored cid))]
                         (aset bytes 0 (bit-xor 1 (aget bytes 0))) (swap! stored assoc cid bytes)

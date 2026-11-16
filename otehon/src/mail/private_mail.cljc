@@ -5,6 +5,7 @@
   (:require [awai.browser-authorized-envelope :as envelope]
             [awai.browser-recipient-envelope :as recipient-envelope]
             [awai.delivery-key-binding :as key-binding]
+            [awai.browser-async-authority :as async-authority]
             [awai.private-message-blocks :as blocks]))
 
 (defn refuse [] (throw (ex-info "private mail refused" {})))
@@ -132,8 +133,13 @@
                  (-> (key-binding/verify! guarded object expected)
                      (.then (fn [actual]
                        (when-not (= actual bindings) (refuse))
-                       (open! (assoc host :admit! (fn [scope candidate]
-                                (and (true? ((:delivery-current! guarded)))
-                                     (true? ((:admit-cid! host) cid expected))
-                                     (true? ((:admit! host) scope candidate)))))
-                              object expected recipient identity)))))))))
+                       (async-authority/guard-value!
+                         (fn [] (-> ((:delivery-current-async! guarded))
+                                    (.then (fn [ok] (and (true? ok)
+                                                         (true? ((:delivery-current! guarded)))
+                                                         (true? ((:admit-cid! host) cid expected)))))))
+                         (fn [] (open! (assoc host :admit! (fn [scope candidate]
+                                      (and (true? ((:delivery-current! guarded)))
+                                           (true? ((:admit-cid! host) cid expected))
+                                           (true? ((:admit! host) scope candidate)))))
+                                    object expected recipient identity)))))))))))
