@@ -3,7 +3,8 @@
    A trusted user-side host supplies authenticated address/key bindings,
    current dango policy and independently verified sender/object admission."
   (:require [awai.browser-authorized-envelope :as envelope]
-            [awai.browser-recipient-envelope :as recipient-envelope]))
+            [awai.browser-recipient-envelope :as recipient-envelope]
+            [awai.private-message-blocks :as blocks]))
 
 (defn refuse [] (throw (ex-info "private mail refused" {})))
 (defn- text? [x n] (and (string? x) (<= 1 (count x) n)))
@@ -11,6 +12,12 @@
   (and (text? x 254) (boolean (re-matches #"[^\s@<>]+@[^\s@<>]+" x))))
 (defn- header? [x n]
   (and (string? x) (<= (count x) n) (not (re-find #"[\r\n]" x))))
+(defn- expected? [expected]
+  (and (map? expected) (= #{:resource :recipients :author :id} (set (keys expected)))
+       (text? (:resource expected) 256) (set? (:recipients expected))
+       (<= 1 (count (:recipients expected)) 32) (every? #(text? % 256) (:recipients expected))
+       (text? (:author expected) 256) (contains? (:recipients expected) (:author expected))
+       (text? (:id expected) 128)))
 (defn- mail? [m]
   (and (map? m) (= #{:schema :id :author :from :to :cc :subject :text :sent-at :in-reply-to} (set (keys m)))
        (= "awai.mail/private-message-v1" (:schema m)) (text? (:id m) 128) (text? (:author m) 256)
@@ -78,9 +85,8 @@
    authenticated; message/peer data cannot supply it. No Bcc is supported."
   [host object expected recipient identity]
   (when-not (and (map? host) (fn? (:admit! host)) (fn? (:bindings! host))
-                 (text? (:author host) 256) (map? expected)
-                 (= #{:resource :recipients :author :id} (set (keys expected)))
-                 (text? (:id expected) 128) (= (:author host) (:author expected))) (refuse))
+                 (text? (:author host) 256) (expected? expected)
+                 (= (:author host) (:author expected))) (refuse))
   (let [admit! (:admit! host)
         scoped (assoc host :admit! (fn [_ candidate] (admit! expected candidate)))]
     (-> (envelope/open scoped object (select-keys expected [:resource :recipients]) recipient identity)
@@ -93,3 +99,33 @@
               (addresses-authorized! host mail (:recipients expected))
               mail)
             (finally (.fill plain 0))))))))
+
+(defn publish!
+  "Publish an already sealed internal mail object against a host-authenticated
+   CID and message basis. The client and each external-operation approval are
+   supplied by the trusted runtime; this is not SMTP or address discovery."
+  [host client object expected mail]
+  (when-not (and (map? host) (expected? expected) (mail? mail) (fn? (:bindings! host))
+                 (fn? (:delivery-current! host)) (= (:resource host) (:resource expected))
+                 (= (:id mail) (:id expected)) (= (:author host) (:author expected) (:author mail))) (refuse))
+  (let [current! (:delivery-current! host)
+        scoped (assoc host :delivery-current!
+                      (fn [] (try (and (true? (current!))
+                                       (do (addresses-authorized! host mail (:recipients expected)) true))
+                                  (catch :default _ false))))]
+    (blocks/publish! scoped client object expected)))
+
+(defn receive!
+  "Receive an authenticated mail object and open it while rechecking delivery
+   authority, CID and the host's sender/basis admission. The existing open
+   path checks current address bindings before releasing plaintext."
+  [host client cid expected recipient identity]
+  (when-not (and (map? host) (expected? expected) (= (:author host) (:author expected))
+                 (fn? (:delivery-current! host)) (fn? (:admit-cid! host)) (fn? (:admit! host))) (refuse))
+  (-> (blocks/receive! host client cid expected)
+      (.then (fn [object]
+               (open! (assoc host :admit! (fn [scope candidate]
+                        (and (true? ((:delivery-current! host)))
+                             (true? ((:admit-cid! host) cid expected))
+                             (true? ((:admit! host) scope candidate)))))
+                      object expected recipient identity)))))
