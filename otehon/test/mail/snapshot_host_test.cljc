@@ -18,7 +18,24 @@
 (.mkdirSync fs dir #js {:recursive true :mode 448})
 (def db (store/open-owned! (.join path dir "credentials.sqlite")))
 (local/initialize-storage! db) (local/initialize-scope! db "post")
-(def idb (atom nil))
+(def idb (atom nil)) (def read-calls (atom []))
+(defn selector [op] #js {:capability "identity" :service "authn" :operation op})
+(defn read-options []
+  (let [broker #js {"invoke" (fn [sel request _]
+                  (let [url (.-input request) op (.-operation sel)
+                        value (if (= op "read-start")
+                                {:id (apply str (repeat 43 "a")) :secret (apply str (repeat 43 "b")) :expires-at 400000}
+                                (signed []))
+                        response (js/Response. (js/JSON.stringify (clj->js value)) #js {:status 201})]
+                    (swap! read-calls conj op) (js/Object.defineProperty response "url" #js {:value url})
+                    (js/Promise.resolve response)))}]
+    {:client-origin "https://client.example" :read-now! (fn [] 100000) :now! (fn [] 100000)
+     :identity-origin "https://identity.example" :tenant-id "t_abcdefghijkl" :audience "https://peer.example"
+     :broker broker :signal (.-signal (js/AbortController.)) :allow-loopback-for-tests? false
+     :read-start-selector (selector "read-start") :read-redeem-selector (selector "read-redeem")
+     :start-selector (selector "block-start") :redeem-selector (selector "block-redeem")
+     :get-selector (selector "get") :put-selector (selector "put")
+     :policy! (fn [] {}) :interact! (fn [_] true) :read-interact! (fn [v] (check (not (contains? v :secret))) true)}))
 (-> (watermark/open! indexedDB (str "awai-dango-revocation-" (.randomUUID js/crypto)))
     (.then (fn [x] (reset! idb x) (watermark/initialize! x tenant 0 (vec (array-seq (sha256 (payload [tenant 0 []])))) #{})))
     (.then (fn [_] (js/Promise.all #js [(virtual/create! "awai.network") (keys/generate-identity)])))
@@ -38,7 +55,14 @@
         (-> (denied #(product/bind-snapshot! raw db (:credential-id auth) holder (assoc trust :roots #{(vec (repeat 32 7))}) (signed [])))
             (.then (fn [v] (check v) (product/bind-snapshot! raw db (:credential-id auth) holder trust (signed []))))
             (.then (fn [host] (reset! old host) (check (true? ((:delivery-current! host))))
-                     (product/bind-snapshot! raw db (:credential-id auth) holder trust (signed [target]))))
+                     (let [opts (read-options)]
+                       (-> (denied #(product/read-approved-delivery! raw db (:credential-id auth) holder trust
+                                      (assoc opts :read-interact! (fn [_] false))))
+                           (.then (fn [rejected] (check rejected) (check (= ["read-start"] @read-calls))
+                                    (product/read-approved-delivery! raw db (:credential-id auth) holder trust opts)))
+                           (.then (fn [result] (check (fn? (get-in result [:host :delivery-current-async!])))
+                                    (check (= ["read-start" "read-start" "read-redeem"] @read-calls))
+                                    (product/bind-snapshot! raw db (:credential-id auth) holder trust (signed [target]))))))))
             (.then (fn [host] (check (false? ((:delivery-current! host)))) ((:delivery-current-async! @old))))
             (.then (fn [live] (check (false? live)) true))))))
     (.then (fn [_] (.close db) (.close @idb) (println (js/JSON.stringify #js {:passed true :scope "Mail signed dango delivery host"}))))

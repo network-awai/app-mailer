@@ -2,6 +2,7 @@
   "Trusted local host for private mail delivery."
   (:require [awai.otehon-delivery-host :as delivery]
             [awai.browser-dango-snapshot :as dango-snapshot]
+            [awai.browser-dango-read-approval :as dango-read]
             [awai.browser-block-authorization :as authorization]
             [awai.kotobase-block-adapter :as blocks]))
 
@@ -39,3 +40,21 @@
 (defn approved-snapshot-delivery! [host db credential-id holder trust snapshot options]
   (-> (dango-snapshot/bind-host! host trust snapshot)
       (.then (fn [verified] (approved-delivery! verified db credential-id holder options)))))
+
+(defn read-approved-delivery!
+  "Request an independently approved snapshot before constructing delivery.
+   The trusted host supplies pinned snapshot roots and direct user interaction.
+   Read start/redeem and block operations require separate broker approvals.
+   This function supplies no consent UI, identity service or SMTP transport."
+  [host db credential-id holder trust
+   {:keys [client-origin read-now! read-interact! read-start-selector read-redeem-selector
+           identity-origin tenant-id broker signal allow-loopback-for-tests?] :as options}]
+  (let [client (dango-read/client
+                 {:client-origin client-origin :current! (:delivery-current! host) :now! read-now!
+                  :admit! (fn [expected snapshot]
+                            (when-not (= tenant-id (:tenant-id expected))
+                              (throw (ex-info "Mail tenant refused" {})))
+                            (dango-snapshot/bind-host! host trust snapshot))}
+                 identity-origin broker read-start-selector read-redeem-selector signal allow-loopback-for-tests?)]
+    (-> (dango-read/request! client tenant-id read-interact!)
+        (.then (fn [verified] (approved-delivery! verified db credential-id holder options))))))
