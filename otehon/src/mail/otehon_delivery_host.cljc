@@ -1,6 +1,7 @@
 (ns mail.otehon-delivery-host
   "Trusted local host for private mail delivery."
   (:require [awai.otehon-delivery-host :as delivery]
+            [awai.browser-block-authorization :as authorization]
             [awai.kotobase-block-adapter :as blocks]))
 
 (defn bind!
@@ -15,3 +16,17 @@
    reviewed canonical operation broker. This is not an SMTP transport."
   [origin broker get-selector put-selector signal allow-loopback-for-tests?]
   (blocks/client origin broker get-selector put-selector signal allow-loopback-for-tests?))
+
+(defn approved-delivery!
+  "Construct the trusted local host, identity approval and peer client using
+   the same peer origin, broker and lifetime signal. This is not SMTP."
+  [host db credential-id holder {:keys [policy! now! interact! identity-origin tenant-id audience
+                                         broker start-selector redeem-selector get-selector put-selector
+                                         signal allow-loopback-for-tests?]}]
+  (let [bound (bind! host db credential-id holder)
+        authorize! (authorization/authorizer
+                     {:current! (:delivery-current! bound) :now! now! :interact! interact!}
+                     policy! identity-origin tenant-id audience broker start-selector redeem-selector signal
+                     allow-loopback-for-tests?)]
+    {:host (assoc bound :authorization! authorize!)
+     :client (client! audience broker get-selector put-selector signal allow-loopback-for-tests?)}))
